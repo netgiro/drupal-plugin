@@ -1,0 +1,448 @@
+<?php
+
+/**
+ * @file
+ * Contains hook implementations and global functions.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function netgiro_payments_menu() {
+  $items['netgiro_payments/redirect/%entity_object'] = array(
+    'load arguments' => array('payment'),
+    'title' => 'Go to payment server',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('netgiro_payments_form_redirect', 2),
+    'access callback' => 'netgiro_payments_form_redirect_access',
+    'access arguments' => array(2),
+    'type' => MENU_CALLBACK,
+  );
+  $items['netgiro_payments/return'] = array(
+    'title' => 'Netgiro Payments Standard return url',
+    'page callback' => 'netgiro_payments_return',
+    'access callback' => 'netgiro_payments_return_access',
+    'type' => MENU_CALLBACK,
+  );
+  $items['netgiro_payments/return/cancel/%entity_object/%'] = array(
+    'load arguments' => array('payment'),
+    'title' => 'Netgiro Payments Standard return url',
+    'page callback' => 'netgiro_payments_return_cancel',
+    'page arguments' => array(3, 4),
+    'access callback' => 'netgiro_payments_return_cancel_access',
+    'access arguments' => array(3, 4),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_payment_method_controller_info().
+ */
+function netgiro_payments_payment_method_controller_info() {
+  return array('NetgiroPaymentsPaymentMethodController');
+}
+
+/**
+ * Implements hook_entity_load().
+ */
+function netgiro_payments_entity_load(array $entities, $entity_type) {
+  if ($entity_type == 'payment_method') {
+    $pmids = array();
+    foreach ($entities as $payment_method) {
+      if ($payment_method->controller->name == 'NetgiroPaymentsPaymentMethodController') {
+        $pmids[] = $payment_method->pmid;
+      }
+    }
+    if ($pmids) {
+      $query = db_select('netgiro_payments_payment_method')
+        ->fields('netgiro_payments_payment_method')
+        ->condition('pmid', $pmids);
+      $result = $query->execute();
+      while ($data = $result->fetchAssoc()) {
+        $payment_method = $entities[$data['pmid']];
+        $payment_method->controller_data = (array) $data;
+        unset($payment_method->controller_data['pmid']);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function netgiro_payments_payment_method_insert(PaymentMethod $payment_method) {
+  if ($payment_method->controller->name == 'NetgiroPaymentsPaymentMethodController') {
+    $values = $payment_method->controller_data += $payment_method->controller->controller_data_defaults;
+    $values['pmid'] = $payment_method->pmid;
+    drupal_write_record('netgiro_payments_payment_method', $values);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function netgiro_payments_payment_method_update(PaymentMethod $payment_method) {
+  if ($payment_method->controller->name == 'NetgiroPaymentsPaymentMethodController') {
+    $values = $payment_method->controller_data += $payment_method->controller->controller_data_defaults;
+    $values['pmid'] = $payment_method->pmid;
+    drupal_write_record('netgiro_payments_payment_method', $values, 'pmid');
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function netgiro_payments_payment_method_delete($entity) {
+  if ($entity->controller->name == 'NetgiroPaymentsPaymentMethodController') {
+    db_delete('netgiro_payments_payment_method')
+      ->condition('pmid', $entity->pmid)
+      ->execute();
+  }
+}
+
+/**
+ * Form build callback: implements
+ * PaymentMethodController::payment_method_configuration_form_elements_callback.
+ */
+function netgiro_payments_payment_method_configuration_form_elements(array $form, array &$form_state) {
+  $payment_method = $form_state['payment_method'];
+  $controller = $payment_method->controller;
+  $controller_data = $payment_method->controller_data + $controller->controller_data_defaults;
+  $form = array();
+
+  $elements['server'] = array(
+    '#default_value' => $controller_data['server'],
+    '#options' => array(
+      $controller::SERVER_URL => t('Production') . ' -- ' . $controller::SERVER_URL,
+      $controller::TEST_SERVER_URL => t('Test') . '     -- ' . $controller::TEST_SERVER_URL,
+    ),
+    '#required' => TRUE,
+    '#title' => t('Netgiró server'),
+    '#type' => 'radios',
+  );
+  $elements['14_days'] = array(
+    '#default_value' => $controller_data['14_days'],
+    '#type' => 'checkbox',
+    '#title' => t('14 days'),
+    '#description' => t('Default payment option.'),
+  );
+  $elements['partial_payments'] = array(
+    '#default_value' => $controller_data['partial_payments'],
+    '#type' => 'checkbox',
+    '#title' => t('Partial payments'),
+    '#description' => t('Offer partial payments.'),
+  );
+  $elements['partial_payments_without_interest'] = array(
+    '#default_value' => $controller_data['partial_payments_without_interest'],
+    '#type' => 'checkbox',
+    '#title' => t('Partial payments without interest'),
+    '#description' => t('Offer partial payments without interests.'),
+  );
+  $elements['application_id'] = array(
+    '#default_value' => $controller_data['application_id'],
+    '#required' => TRUE,
+    '#title' => t('Application ID'),
+    '#type' => 'textfield',
+    '#description' => t('Is available at "netgiro.is".'),
+  );
+  $elements['secret_key'] = array(
+    '#default_value' => $controller_data['secret_key'],
+    '#required' => TRUE,
+    '#title' => t('Secret Key'),
+    '#type' => 'textarea',
+    '#description' => t('Given to merchants by Netgíró.'),
+    '#rows' => 2,
+  );
+  return $elements;
+}
+
+/**
+ * Implements form validate callback for
+ * netgiro_payments_payment_method_configuration_form_elements().
+ */
+function netgiro_payments_payment_method_configuration_form_elements_validate(array $element, array &$form_state) {
+  $values = drupal_array_get_nested_value($form_state['values'], $element['#parents']);
+
+  $controller_data = &$form_state['payment_method']->controller_data;
+  $controller_data['server'] = $values['server'];
+  $controller_data['14_days'] = $values['14_days'];
+  $controller_data['partial_payments'] = $values['partial_payments'];
+  $controller_data['partial_payments_without_interest'] = $values['partial_payments_without_interest'];
+  $controller_data['application_id'] = $values['application_id'];
+  $controller_data['secret_key'] = $values['secret_key'];
+
+}
+
+/**
+ * Access callback for the redirect page.
+ *
+ * @param Payment $payment
+ *   The payment to check access to.
+ * @param object $user
+ *   An optional user to check access for. If NULL, then the currently logged
+ *   in user is used.
+ *
+ * @return bool
+ */
+function netgiro_payments_form_redirect_access(Payment $payment, $account = NULL) {
+  global $user;
+
+  return is_a($payment->method->controller, 'NetgiroPaymentsPaymentMethodController')
+    && payment_status_is_or_has_ancestor($payment->getStatus()->status, PAYMENT_STATUS_PENDING)
+    && isset($_SESSION['netgiro_payments_pid']) && $_SESSION['netgiro_payments_pid'] == $payment->pid;
+}
+
+/**
+ * Return callback.
+ */
+function netgiro_payments_return() {
+  $ng_variables = $_GET;
+  $description = 'Order ' . mysql_real_escape_string($ng_variables['ng_referenceNumber']);
+  $pid = db_query("SELECT pid FROM {payment} WHERE description = '".$description."'")->fetchAssoc()['pid'];
+  $payment = entity_load_single('payment', $pid);
+  $payment_status = PAYMENT_STATUS_FAILED;
+  switch ($ng_variables['ng_status']) {
+    case 1:
+      $payment_status = PAYMENT_STATUS_PENDING;
+      break;
+    case 2:
+      $payment_status = PAYMENT_STATUS_SUCCESS;
+      break;
+    case 5:
+      $payment_status = PAYMENT_STATUS_CANCELLED;
+      break;
+  }
+  $payment->setStatus(new PaymentStatusItem($payment_status));
+  $payment->finish();
+}
+
+/**
+ * Access callback for the return URL.
+ *
+ * @return bool
+ */
+function netgiro_payments_return_access() {
+  return validateNetgiroAnswer($_GET);
+}
+
+
+function validateNetgiroAnswer(array $ng_variables) {
+
+  if($ng_variables['ng_netgiroSignature'] && $ng_variables['ng_referenceNumber'] && $ng_variables['ng_transactionid'] ) {
+      
+    if (isset($ng_variables['ng_referenceNumber'])) {
+      $description = 'Order ' . mysql_real_escape_string($ng_variables['ng_referenceNumber']);
+      $pid = db_query("SELECT pid FROM {payment} WHERE description = '".$description."'")->fetchAssoc()['pid'];
+
+      if ($pid) {
+        $payment = entity_load_single('payment', $pid);
+     
+        if ($payment) {
+          $controller_data = $payment->method->controller_data;
+
+          $str = $controller_data['secret_key'] . $ng_variables['ng_referenceNumber'] 
+                 . $ng_variables['ng_transactionid'] . $ng_variables['ng_invoiceNumber'] 
+                 . $ng_variables['ng_totalAmount'] . $ng_variables['ng_status'];
+          $hash = hash('sha256', $str);
+
+          if($hash==$ng_variables['ng_netgiroSignature'] && $payment->context_data['balance_amount']==$ng_variables['ng_totalAmount']) { 
+            return TRUE;
+          }
+        }
+      }
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Cancellation return callback.
+ *
+ * @return Payment
+ *
+ * @return NULL
+ */
+function netgiro_payments_return_cancel(Payment $payment) {
+  $payment->setStatus(new PaymentStatusItem(PAYMENT_STATUS_CANCELLED));
+  $payment->finish();
+}
+
+/**
+ * Access callback for the cancellation return URL.
+ *
+ * @param Payment $payment
+ *   The Payment to check access to.
+ * @param string $hash
+ *   The hash based on $payment->pid.
+ *
+ * @return bool
+ */
+function netgiro_payments_return_cancel_access(Payment $payment, $hash) {
+  return hashPID($payment->pid) == $hash;
+}
+
+/**
+ * Hashes a Payment PID.
+ *
+ * @param integer $pid
+ *
+ * @return string
+ */
+function hashPID($pid) {
+  return hash('sha256', $pid . drupal_get_hash_salt());
+}
+
+/**
+ * Generate netgiro button link
+ **/
+function netgiro_payments_form_redirect(array $form, array &$form_state, Payment $payment){
+  global $base_url;
+  global $language;
+
+  $controller_data = $payment->method->controller_data;
+  $order_id = $payment->context_data['order_id'];
+
+  //$order = new WC_Order( $order_id );
+  $txnid = $order_id .'_'.date("ymds");
+  
+  // Prepare POST data.
+  $return_url = url('netgiro_payments/return', array(
+    'absolute' => TRUE,
+  ));
+  $cancel_return_url = url('netgiro_payments/return/cancel/' . $payment->pid . '/' . hashPID($payment->pid), array(
+    'absolute' => TRUE,
+  ));
+
+  $total = 0;
+  foreach ($payment->line_items as $line_item) {
+    $total += $line_item->totalAmount(TRUE);
+  }
+  //var_dump($payment);
+  //die();
+  $total = number_format($total, 0, '', '');
+
+  $str = $controller_data['secret_key'] . $order_id . $total . $controller_data['application_id'];
+  $Signature = hash('sha256', $str);
+
+  // Netgiro arguments
+  $netgiro_args = array(
+    'ApplicationID' => $controller_data['application_id'],
+    'Iframe' => 'false',
+    'PaymentSuccessfulURL' => $return_url,
+    'PaymentCancelledURL' => $cancel_return_url,
+    'ConfirmationType'=>'0', 
+    'ReferenceNumber' => $order_id,
+    'TotalAmount'=> $total,
+    'Signature' => $Signature,
+    'PrefixUrlParameters' => 'true'
+  );
+
+  $netgiro_args_array = array();
+  foreach($netgiro_args as $key => $value){
+    $netgiro_args_array[] = "<input type='hidden' name='$key' value='$value'/>";
+  }
+
+  // Drupal commerce -> Netgiro Items
+  foreach ($payment->line_items as $item) {
+    $items[] = array(
+      'ProductNo'=>$item->pid,
+      'Name'=> $item->name,
+      'UnitPrice'=> ($item->amount_total+$item->tax_rate) / $item->quantity,
+      'Amount'=> ($item->amount_total+$item->tax_rate),
+      'Quantity'=> $item->quantity * 1000,
+    );
+  }
+
+  // Create Items
+  for ($i=0; $i <= count($items)-1; $i++) { 
+    foreach($items[$i] as $key => $value){
+      $netgiro_items_array[] = "<input type='hidden' name='Items[$i].$key' value='$value'/>";
+    }          
+  }
+  
+  if (!isset($methods)) {
+    $methods = '';
+  }
+
+  if($controller_data['14_days']) {
+    $methods .= '<li class="method_reikningur" id="netgiro-branding-p1"><div class="logo" id="netgiro-branding-p1-logo"><img id="netgiro-branding-p1-image" src="'.drupal_get_path('module', 'netgiro_payments').'/logos/netgiro_reikningur.png'.'" /></div>
+            <input type="radio" name="PaymentOption" selected value="1" checked="1" /> <strong id="netgiro-branding-p1-title">Netgíró reikningur</strong><p id="netgiro-branding-p1-text"> </p></li>';
+  }
+  if($controller_data['partial_payments']) {
+    $methods .= '<li class="method_reikningur" id="netgiro-branding-p2"><div class="logo" id="netgiro-branding-p2-logo"><img id="netgiro-branding-p2-image" src="'.drupal_get_path('module', 'netgiro_payments').'/logos/netgiro_radgreidslur.png'.'" /></div>
+            <input type="radio" name="PaymentOption" value="2" /> <strong id="netgiro-branding-p2-title">Netgíró raðgreiðslur</strong><p id="netgiro-branding-p2-text"> </p></li>';
+  }
+  if($controller_data['partial_payments_without_interest']) {
+    $methods .= '<li class="method_reikningur" id="netgiro-branding-p3"><div class="logo" id="netgiro-branding-p3-logo"><img id="netgiro-branding-p3-image" src="'.drupal_get_path('module', 'netgiro_payments').'/logos/netgiro_vaxtalausar-radgreidslur.png'.'" /></div>
+            <input type="radio" name="PaymentOption" value="3" /> <strong id="netgiro-branding-p3-title">Netgíró vaxtalausar raðgreiðslur</strong><p id="netgiro-branding-p3-text"> </p></li>';
+  }
+
+  $methods_init = 'netgiro.branding.options = { ';
+  if($controller_data['14_days']) {
+    $methods_init .= 'showP1: true,';
+  }
+  if($controller_data['partial_payments']) {
+    $methods_init .= 'showP2: true,';
+  }
+  if($controller_data['partial_payments_without_interest']) {
+    $methods_init .= 'showP3: true';
+  }
+  $methods_init .= ' } ';
+
+  // Setup the form to post to netgiro
+  $form['#action'] = $controller_data['server'];
+  $form['#method'] = 'post';
+  $form['message'] = array(
+    '#type' => 'markup',
+    '#markup' =>
+          implode('', $netgiro_args_array) . '  
+      ' . implode('', $netgiro_items_array) . '
+
+      <div id="netgiro-branding-container">
+        <ul id="netgiro_methods">
+            '.$methods.'
+        </ul>
+      </div>
+    <p>' . t('You will be redirected to the off-site payment server to authorize the payment.') . '</p>',
+  );
+  
+  $form['js'] = array(
+    '#type' => 'markup',
+    '#markup' => '
+    <style>
+      #netgiro_methods { padding: 0px; margin: 0xp; }
+      #netgiro_methods li { margin: 0px; margin-bottom: -1px; background: #f3f3f3; border: solid 1px #ccc; padding: 15px; color: #676968; list-style:none; }
+      #netgiro_methods li .logo { float: right; width: 250px; }
+      #netgiro_methods li .logo img { border: none; box-shadow: none;}
+      #netgiro_methods strong { font-size: 1.7em; font-weight: bold; }
+      #netgiro_methods p { margin: 0px; }
+    </style>
+    
+    <script src="//api.netgiro.is/scripts/netgiro.api.js" type="text/javascript"></script>
+
+    <script>
+        jQuery(document).ready(function () {
+            '.$methods_init.'
+            netgiro.branding.init("881E674F-7891-4C20-AFD8-56FE2624C4B5");
+        });
+    </script>
+
+    <script>
+      jQuery(function() {
+          jQuery(\'.method_reikningur\').click(function() {
+            jQuery(this).find(\'input\').prop(\'checked\', true);
+          });
+      });
+    </script>
+    ',
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Greiða með Netgíró'),
+  );
+
+  return $form;
+}
